@@ -1,0 +1,5 @@
+name: astrbot_plugin_sealdice_core
+desc: SeaDice-style COC7 and DND5e dice commands for AstrBot.
+author: Codex
+version: 0.1.0
+display_name: 海豹骰核心复刻

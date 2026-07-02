@@ -21,6 +21,14 @@ cookies.json
 data_v2.db
 data_v3.db
 data
+!data/
+data/*
+!data/__init__.py
+!data/plugins/
+data/plugins/*
+!data/plugins/__init__.py
+!data/plugins/astrbot_plugin_sealdice_core/
+!data/plugins/astrbot_plugin_sealdice_core/**
 configs/session
 configs/config.yaml
 cmd_config.json

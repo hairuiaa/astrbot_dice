@@ -1,0 +1,27 @@
+{
+  "route": {
+    "type": "string",
+    "default": "python",
+    "description": "运行路线：python、go_bridge 或 auto。"
+  },
+  "go_bridge_url": {
+    "type": "string",
+    "default": "http://127.0.0.1:3211",
+    "description": "SeaDice Go 桥接服务地址。"
+  },
+  "go_bridge_password": {
+    "type": "string",
+    "default": "",
+    "description": "SeaDice Go 桥接登录密码。"
+  },
+  "enable_legacy_js_compat": {
+    "type": "bool",
+    "default": true,
+    "description": "启用海豹 JS、牌堆、回复和 sealpack 兼容层状态管理。"
+  },
+  "reply_to_unknown_compat_command": {
+    "type": "bool",
+    "default": true,
+    "description": "遇到已登记但尚未实现的 SeaDice 扩展指令时返回兼容提示。"
+  }
+}

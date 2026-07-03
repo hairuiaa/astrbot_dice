@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import random
@@ -9,6 +10,8 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .command_router import CommandRouter
+from .feature_matrix import find_feature_docs, format_feature_matrix
 
 COC_DEFAULTS = {
     "str": 50,
@@ -89,6 +92,38 @@ INDEFINITE_INSANITY = [
     "抑郁",
 ]
 
+DEFAULT_DECKS = {
+    "dnd": [
+        "一瓶写着旧标签的治疗药水",
+        "一枚刻着徽记的银币",
+        "一封没有署名的短笺",
+        "一把磨损严重的匕首",
+        "一块带血的绷带",
+    ],
+    "coc": [
+        "一张折过三次的车票",
+        "一本边角潮湿的笔记",
+        "一枚黄铜钥匙",
+        "一张被撕掉半边的照片",
+        "一只空药瓶",
+    ],
+}
+
+CN_SURNAMES = ["赵", "钱", "孙", "李", "周", "吴", "郑", "王", "林", "许"]
+CN_GIVEN = ["明", "然", "一", "宁", "秋", "远", "岚", "青", "白", "南"]
+DND_NAMES = [
+    "Aelar",
+    "Bran",
+    "Cora",
+    "Dain",
+    "Elaith",
+    "Garrick",
+    "Mira",
+    "Nyx",
+    "Tarin",
+    "Vera",
+]
+
 
 @dataclass
 class CharacterSheet:
@@ -109,6 +144,7 @@ class PlayerState:
     active: str = "default"
     sheets: dict[str, CharacterSheet] = field(default_factory=dict)
     sn_template: str = ""
+    aliases: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -124,10 +160,18 @@ class LogEntry:
 class GroupState:
     active: bool = True
     rule: str = "coc"
+    coc_rule: str = "0"
     players: dict[str, PlayerState] = field(default_factory=dict)
     logs: dict[str, LogEntry] = field(default_factory=dict)
     active_log: str = ""
     initiative: list[dict[str, Any]] = field(default_factory=list)
+    aliases: dict[str, str] = field(default_factory=dict)
+    decks: dict[str, list[str]] = field(default_factory=dict)
+    custom_replies_enabled: bool = True
+    helpdocs: dict[str, str] = field(default_factory=dict)
+    sealpacks: dict[str, dict[str, str]] = field(default_factory=dict)
+    teams: dict[str, list[str]] = field(default_factory=dict)
+    bans: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -246,10 +290,15 @@ class SeaDiceService:
         self,
         state_path: str | Path | None = None,
         rng: random.Random | None = None,
+        config: dict[str, Any] | None = None,
     ) -> None:
         self.state_path = Path(state_path) if state_path else None
         self.roller = DiceRoller(rng)
+        self.config = config or {}
+        self.router = CommandRouter()
         self.groups: dict[str, GroupState] = {}
+        self._current_context: dict[str, str] = {}
+        self._register_handlers()
         self._load()
 
     def handle(
@@ -269,76 +318,26 @@ class SeaDiceService:
             return None
         group = self._group(group_id)
         player = self._player(group, user_id, sender_name)
-        first, rest = self._split_first(body)
-        cmd = first.lower()
+        cmd, rest = self._parse_command_body(body)
         if cmd not in {"bot", "sealhelp", "help"} and not group.active:
             return CommandOutcome("骰子当前关闭。使用 .bot on 开启。")
 
-        handlers = {
-            "bot": self._cmd_bot,
-            "set": self._cmd_set,
-            "nn": self._cmd_nn,
-            "pc": self._cmd_pc,
-            "ch": self._cmd_pc,
-            "char": self._cmd_pc,
-            "character": self._cmd_pc,
-            "角色": self._cmd_pc,
-            "st": self._cmd_st,
-            "cst": self._cmd_st,
-            "dst": self._cmd_st,
-            "coc": self._cmd_coc,
-            "dnd": self._cmd_dnd,
-            "dndx": self._cmd_dnd,
-            "r": self._cmd_roll,
-            "rd": self._cmd_roll,
-            "roll": self._cmd_roll,
-            "rh": self._cmd_roll,
-            "rhd": self._cmd_roll,
-            "rdh": self._cmd_roll,
-            "rx": self._cmd_roll,
-            "rxh": self._cmd_roll,
-            "rhx": self._cmd_roll,
-            "ra": self._cmd_check,
-            "rc": self._cmd_check,
-            "rah": self._cmd_check,
-            "rch": self._cmd_check,
-            "cra": self._cmd_check,
-            "crc": self._cmd_check,
-            "crah": self._cmd_check,
-            "crch": self._cmd_check,
-            "rav": self._cmd_check,
-            "rcv": self._cmd_check,
-            "sc": self._cmd_san,
-            "en": self._cmd_en,
-            "ti": self._cmd_ti,
-            "li": self._cmd_li,
-            "ri": self._cmd_ri,
-            "init": self._cmd_init,
-            "buff": self._cmd_buff,
-            "dbuff": self._cmd_dbuff,
-            "spellslots": self._cmd_spellslots,
-            "ss": self._cmd_spellslots,
-            "dss": self._cmd_spellslots,
-            "法术位": self._cmd_spellslots,
-            "cast": self._cmd_cast,
-            "dcast": self._cmd_cast,
-            "长休": self._cmd_longrest,
-            "longrest": self._cmd_longrest,
-            "dlongrest": self._cmd_longrest,
-            "ds": self._cmd_death_save,
-            "死亡豁免": self._cmd_death_save,
-            "log": self._cmd_log,
-            "stat": self._cmd_stat,
-            "sn": self._cmd_sn,
-            "ob": self._cmd_ob,
-            "sealhelp": self._cmd_help,
-            "help": self._cmd_help,
-            "ext": self._cmd_ext,
-        }
-        handler = handlers.get(cmd)
+        if user_id in group.bans and cmd not in {"help", "sealhelp", "bot"}:
+            return CommandOutcome("该用户在本群黑名单中。")
+
+        handler = self.router.get(cmd)
         if not handler:
             return None
-        outcome = handler(cmd, rest, group, player, user_id)
+        self._current_context = {
+            "group_id": group_id,
+            "user_id": user_id,
+            "sender_name": sender_name,
+            "raw": raw,
+        }
+        try:
+            outcome = handler(cmd, rest, group, player, user_id)
+        finally:
+            self._current_context = {}
         if outcome and outcome.text:
             self._record(group, user_id, sender_name, raw, outcome.text)
         self._save()
@@ -362,17 +361,104 @@ class SeaDiceService:
                 log.lines.append(f"{who}: {text}")
                 self._save()
 
+    def _parse_command_body(self, body: str) -> tuple[str, str]:
+        first, rest = self._split_first(body)
+        exact = first.lower()
+        if self.router.get(exact):
+            return exact, rest
+        matched = self.router.match_prefix(body)
+        if matched:
+            cmd, rest_text, _ = matched
+            return cmd, rest_text
+        return exact, rest
+
+    def _register_handlers(self) -> None:
+        self.router.register(("bot",), self._cmd_bot)
+        self.router.register(("set",), self._cmd_set)
+        self.router.register(("setcoc",), self._cmd_setcoc)
+        self.router.register(("nn",), self._cmd_nn)
+        self.router.register(("pc", "ch", "char", "character", "角色"), self._cmd_pc)
+        self.router.register(("st", "cst", "dst"), self._cmd_st)
+        self.router.register(("coc",), self._cmd_coc)
+        self.router.register(("dnd", "dndx"), self._cmd_dnd)
+        self.router.register(
+            ("r", "rd", "roll", "rh", "rhd", "rdh", "rx", "rxh", "rhx"),
+            self._cmd_roll,
+        )
+        self.router.register(
+            (
+                "ra",
+                "rc",
+                "rah",
+                "rch",
+                "cra",
+                "crc",
+                "crah",
+                "crch",
+                "rav",
+                "rcv",
+            ),
+            self._cmd_check,
+        )
+        self.router.register(("sc",), self._cmd_san)
+        self.router.register(("en",), self._cmd_en)
+        self.router.register(("ti",), self._cmd_ti)
+        self.router.register(("li",), self._cmd_li)
+        self.router.register(("ri",), self._cmd_ri)
+        self.router.register(("init",), self._cmd_init)
+        self.router.register(("buff",), self._cmd_buff)
+        self.router.register(("dbuff",), self._cmd_dbuff)
+        self.router.register(("spellslots", "ss", "dss", "法术位"), self._cmd_spellslots)
+        self.router.register(("cast", "dcast"), self._cmd_cast)
+        self.router.register(("长休", "longrest", "dlongrest"), self._cmd_longrest)
+        self.router.register(("ds", "死亡豁免"), self._cmd_death_save)
+        self.router.register(("log",), self._cmd_log)
+        self.router.register(("stat", "hiy"), self._cmd_stat)
+        self.router.register(("sn",), self._cmd_sn)
+        self.router.register(("ob",), self._cmd_ob)
+        self.router.register(("sealhelp", "help"), self._cmd_help)
+        self.router.register(("find", "查询", "査詢"), self._cmd_find)
+        self.router.register(("helpdoc",), self._cmd_helpdoc)
+        self.router.register(("ext",), self._cmd_ext)
+        self.router.register(("js",), self._cmd_js)
+        self.router.register(("sealpack",), self._cmd_sealpack)
+        self.router.register(("matrix",), self._cmd_matrix)
+        self.router.register(("draw", "deck"), self._cmd_deck)
+        self.router.register(("alias",), self._cmd_alias)
+        self.router.register(("&", "a"), self._cmd_alias_exec)
+        self.router.register(("reply",), self._cmd_reply)
+        self.router.register(("jrrp",), self._cmd_jrrp)
+        self.router.register(("gugu", "咕咕"), self._cmd_gugu)
+        self.router.register(("ping",), self._cmd_ping)
+        self.router.register(("who",), self._cmd_who)
+        self.router.register(("name", "namednd"), self._cmd_name)
+        self.router.register(("cnmods", "modu", "魔都"), self._cmd_modu)
+        self.router.register(("userid",), self._cmd_userid)
+        self.router.register(("botlist",), self._cmd_botlist)
+        self.router.register(("dismiss",), self._cmd_dismiss)
+        self.router.register(("master",), self._cmd_master)
+        self.router.register(("black", "ban"), self._cmd_ban)
+        self.router.register(("team",), self._cmd_team)
+        self.router.register(
+            ("text", "rsr", "ek", "ekgen", "dx", "dxh", "w", "ww", "wh", "wwh", "jsr", "drl", "drlh", "check", "send", "welcome"),
+            self._cmd_compat_placeholder,
+        )
+
     def help_text(self) -> str:
         return (
             "海豹骰核心指令：\n"
             ".bot on/off/about\n"
             ".set coc/dnd/info/clr\n"
-            ".nn 昵称；.pc new/load/save/list/del/tag\n"
-            ".st hp=10 hp-1；.cst；.dst\n"
-            ".r 1d100；.ra 侦查；.rc 侦查；.sc 1/1d6\n"
-            ".coc；.en 侦查；.ti；.li\n"
-            ".dnd；.dndx；.ri；.init；.ss；.cast；.longrest；.ds\n"
+            ".nn 昵称 .pc new/load/save/list/del/tag\n"
+            ".st hp=10 hp-1 .cst .dst\n"
+            ".r 1d100 .ra 侦查 .rc 侦查 .sc 1/1d6\n"
+            ".coc .en 侦查 .ti .li\n"
+            ".dnd .dndx .ri .init .ss .cast .longrest .ds\n"
             ".log new/on/off/end/list/get/del/stat/export\n"
+            ".draw 牌堆 .deck list/add/show/del\n"
+            ".alias 名称 .指令 .&名称 .jrrp .who .name\n"
+            ".find 关键词 .helpdoc list/add/get/del .matrix\n"
+            ".ext .js .sealpack .black .team\n"
             ".sn coc/cocL/dnd/none/off/expr ..."
         )
 
@@ -406,11 +492,18 @@ class SeaDiceService:
             self._sheet(group, player, "dnd")
             return CommandOutcome("当前规则已切换为 DND5e。", group_card=self._render_sn(player))
         if arg in {"info", ""}:
-            return CommandOutcome(f"当前规则：{group.rule}")
+            return CommandOutcome(f"当前规则：{group.rule}\nCOC 房规：{group.coc_rule}")
         if arg in {"clr", "clear"}:
             group.rule = "coc"
             return CommandOutcome("群规则已重置为 COC7。")
         return CommandOutcome("用法：.set coc/dnd/info/clr")
+
+    def _cmd_setcoc(self, cmd: str, rest: str, group: GroupState, player: PlayerState, user_id: str) -> CommandOutcome:
+        value = rest.strip() or "0"
+        group.coc_rule = value
+        group.rule = "coc"
+        self._sheet(group, player, "coc")
+        return CommandOutcome(f"COC 房规已设置为 {value}。")
 
     def _cmd_nn(self, cmd: str, rest: str, group: GroupState, player: PlayerState, user_id: str) -> CommandOutcome:
         name = rest.strip()
@@ -490,12 +583,15 @@ class SeaDiceService:
         for item in re.split(r"[\s,，]+", rest.strip()):
             if not item:
                 continue
-            m = re.fullmatch(r"([^=+\-:：]+)([=+\-:：])(-?\d+)", item)
-            if not m:
+            parsed = self._parse_attr_change(item)
+            if not parsed:
                 return CommandOutcome(f"无法识别属性改动：{item}")
-            key, op, value_text = m.groups()
+            key, op, value_text = parsed
             key = self._attr_key(key.strip(), sheet)
-            value = int(value_text)
+            try:
+                value, _ = self.roller.roll_expr(value_text)
+            except DiceError as exc:
+                return CommandOutcome(f"属性表达式错误：{item}，{exc}")
             old = int(sheet.attrs.get(key, 0))
             if op in {"=", ":", "："}:
                 new = value
@@ -580,23 +676,30 @@ class SeaDiceService:
 
     def _cmd_san(self, cmd: str, rest: str, group: GroupState, player: PlayerState, user_id: str) -> CommandOutcome:
         sheet = self._sheet(group, player, "coc")
-        expr = rest.strip() or "0/1d6"
-        parts = expr.split()
-        loss_expr = parts[0]
-        target = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else int(sheet.attrs.get("san", sheet.attrs.get("理智", 0)))
-        if "/" not in loss_expr:
-            return CommandOutcome("用法：.sc 成功损失/失败损失，例如 .sc 0/1d6")
-        success_expr, fail_expr = loss_expr.split("/", 1)
+        dice_expr, success_expr, fail_expr, target = self._parse_san_args(
+            rest.strip(),
+            sheet,
+        )
         roll = self.roller.d100()
+        roll_detail = str(roll)
+        if dice_expr.lower() not in {"d100", "1d100"}:
+            try:
+                roll, roll_detail = self.roller.roll_expr(dice_expr)
+            except DiceError as exc:
+                return CommandOutcome(f"SAN Check 判定表达式错误：{exc}")
         ok = roll <= target
-        loss_total, loss_detail = self.roller.roll_expr(success_expr if ok else fail_expr)
+        loss_expr = success_expr if ok else fail_expr
+        try:
+            loss_total, loss_detail = self.roller.roll_expr(loss_expr)
+        except DiceError as exc:
+            return CommandOutcome(f"SAN Check 损失表达式错误：{exc}")
         old = int(sheet.attrs.get("san", sheet.attrs.get("理智", 0)))
         new = max(0, old - loss_total)
         sheet.attrs["san"] = new
         sheet.attrs["理智"] = new
         result = "成功" if ok else "失败"
         return CommandOutcome(
-            f"SAN Check：D100={roll}/{target}，{result}，损失 {loss_total} ({loss_detail})，SAN {old}->{new}",
+            f"SAN Check：{dice_expr}={roll}/{target} ({roll_detail})，{result}，损失 {loss_total} ({loss_detail})，SAN {old}->{new}",
             group_card=self._render_sn(player),
         )
 
@@ -605,8 +708,9 @@ class SeaDiceService:
         key = rest.strip()
         if not key:
             return CommandOutcome("用法：.en 技能名")
+        key, explicit_value = self._split_name_value(key)
         key = self._attr_key(key, sheet)
-        old = int(sheet.attrs.get(key, 0))
+        old = explicit_value if explicit_value is not None else int(sheet.attrs.get(key, 0))
         roll = self.roller.d100()
         if roll > old:
             inc, detail = self.roller.roll_expr("1d10")
@@ -797,7 +901,319 @@ class SeaDiceService:
         return CommandOutcome("OB 记录已保留为日志兼容项。当前版本可使用 .log 记录观战文本。")
 
     def _cmd_ext(self, cmd: str, rest: str, group: GroupState, player: PlayerState, user_id: str) -> CommandOutcome:
-        return CommandOutcome("COC7 和 DND5e 已内置启用。")
+        enabled = self._config_bool("enable_legacy_js_compat", True)
+        status = "开启" if enabled else "关闭"
+        return CommandOutcome(
+            "COC7 和 DND5e 已内置启用。\n"
+            f"海豹 JS 兼容层：{status}\n"
+            "新扩展建议使用 AstrBot 插件体系。",
+        )
+
+    def _cmd_find(self, cmd: str, rest: str, group: GroupState, player: PlayerState, user_id: str) -> CommandOutcome:
+        query = rest.strip()
+        docs = []
+        if query:
+            q = query.lower()
+            for key, text in group.helpdocs.items():
+                if q in key.lower() or q in text.lower():
+                    docs.append(f"{key}: {text}")
+        matrix = find_feature_docs(query)
+        if docs:
+            return CommandOutcome(matrix + "\n群内 helpdoc：\n" + "\n".join(docs))
+        return CommandOutcome(matrix)
+
+    def _cmd_helpdoc(self, cmd: str, rest: str, group: GroupState, player: PlayerState, user_id: str) -> CommandOutcome:
+        action, arg = self._split_first(rest.strip())
+        action = action.lower() or "list"
+        if action in {"list", "ls"}:
+            if not group.helpdocs:
+                return CommandOutcome("当前没有群内 helpdoc。")
+            return CommandOutcome("群内 helpdoc：\n" + "\n".join(sorted(group.helpdocs)))
+        if action in {"get", "show"}:
+            key = arg.strip()
+            if not key or key not in group.helpdocs:
+                return CommandOutcome("没有找到对应 helpdoc。")
+            return CommandOutcome(f"{key}:\n{group.helpdocs[key]}")
+        if action == "add":
+            key, text = self._split_first(arg)
+            if not key or not text:
+                return CommandOutcome("用法：.helpdoc add 名称 内容")
+            group.helpdocs[key] = text.strip()
+            return CommandOutcome(f"helpdoc 已保存：{key}")
+        if action in {"del", "rm"}:
+            key = arg.strip()
+            if group.helpdocs.pop(key, None) is None:
+                return CommandOutcome("没有找到对应 helpdoc。")
+            return CommandOutcome(f"helpdoc 已删除：{key}")
+        return CommandOutcome("用法：.helpdoc list/get/add/del")
+
+    def _cmd_js(self, cmd: str, rest: str, group: GroupState, player: PlayerState, user_id: str) -> CommandOutcome:
+        action = rest.strip().lower() or "status"
+        enabled = self._config_bool("enable_legacy_js_compat", True)
+        if action in {"status", "info"}:
+            state = "开启" if enabled else "关闭"
+            return CommandOutcome(f"海豹 JS 兼容层：{state}。当前不执行任意 JS。")
+        if action in {"list", "ls"}:
+            packs = ", ".join(sorted(group.sealpacks)) or "无"
+            return CommandOutcome(f"已记录扩展包：{packs}")
+        if action in {"reload", "on", "off"}:
+            return CommandOutcome("JS 扩展启停交给兼容层记录，新扩展请使用 AstrBot 插件。")
+        return CommandOutcome("用法：.js status/list/reload")
+
+    def _cmd_sealpack(self, cmd: str, rest: str, group: GroupState, player: PlayerState, user_id: str) -> CommandOutcome:
+        action, arg = self._split_first(rest.strip())
+        action = action.lower() or "list"
+        if action in {"list", "ls", "status"}:
+            if not group.sealpacks:
+                return CommandOutcome("当前没有记录 sealpack。")
+            lines = [f"{name}: {meta.get('state', 'imported')} {meta.get('path', '')}" for name, meta in group.sealpacks.items()]
+            return CommandOutcome("sealpack 记录：\n" + "\n".join(lines))
+        if action in {"import", "add"}:
+            path = Path(arg.strip())
+            if not path.name:
+                return CommandOutcome("用法：.sealpack import 文件.sealpack")
+            if path.suffix.lower() != ".sealpack":
+                return CommandOutcome("只能记录 .sealpack 文件。")
+            group.sealpacks[path.name] = {"path": str(path), "state": "imported"}
+            return CommandOutcome(f"sealpack 已记录：{path.name}")
+        if action in {"del", "rm"}:
+            name = arg.strip()
+            if group.sealpacks.pop(name, None) is None:
+                return CommandOutcome("没有找到对应 sealpack。")
+            return CommandOutcome(f"sealpack 已删除：{name}")
+        return CommandOutcome("用法：.sealpack list/import/del")
+
+    def _cmd_matrix(self, cmd: str, rest: str, group: GroupState, player: PlayerState, user_id: str) -> CommandOutcome:
+        return CommandOutcome(format_feature_matrix(rest.strip()))
+
+    def _cmd_deck(self, cmd: str, rest: str, group: GroupState, player: PlayerState, user_id: str) -> CommandOutcome:
+        if cmd == "draw":
+            deck_name = rest.strip() or "coc"
+            return self._draw_from_deck(deck_name, group)
+        action, arg = self._split_first(rest.strip())
+        action = action.lower() or "list"
+        if action in {"list", "ls"}:
+            names = sorted(set(DEFAULT_DECKS) | set(group.decks))
+            return CommandOutcome("牌堆列表：" + (" ".join(names) if names else "无"))
+        if action == "draw":
+            return self._draw_from_deck(arg.strip() or "coc", group)
+        if action in {"show", "get"}:
+            name = arg.strip()
+            cards = self._deck_cards(name, group)
+            if not cards:
+                return CommandOutcome("没有找到牌堆。")
+            return CommandOutcome(f"{name}：\n" + "\n".join(cards[:30]))
+        if action == "add":
+            name, cards_text = self._split_first(arg)
+            cards = [card.strip() for card in re.split(r"[|｜]", cards_text) if card.strip()]
+            if not name or not cards:
+                return CommandOutcome("用法：.deck add 名称 卡1|卡2|卡3")
+            group.decks[name] = cards
+            return CommandOutcome(f"牌堆已保存：{name}，共 {len(cards)} 张。")
+        if action in {"del", "rm"}:
+            name = arg.strip()
+            if group.decks.pop(name, None) is None:
+                return CommandOutcome("没有找到自定义牌堆。")
+            return CommandOutcome(f"牌堆已删除：{name}")
+        return CommandOutcome("用法：.deck list/draw/show/add/del")
+
+    def _cmd_alias(self, cmd: str, rest: str, group: GroupState, player: PlayerState, user_id: str) -> CommandOutcome:
+        action, arg = self._split_first(rest.strip())
+        if not action or action.lower() in {"list", "ls"}:
+            items = []
+            items.extend(f"{name} -> {target}" for name, target in sorted(group.aliases.items()))
+            items.extend(f"{name} -> {target}" for name, target in sorted(player.aliases.items()))
+            return CommandOutcome("快捷指令：\n" + ("\n".join(items) if items else "无"))
+        if action.lower() in {"del", "rm"}:
+            name = arg.strip()
+            removed = player.aliases.pop(name, None)
+            removed = group.aliases.pop(name, None) if removed is None else removed
+            if removed is None:
+                return CommandOutcome("没有找到快捷指令。")
+            return CommandOutcome(f"快捷指令已删除：{name}")
+        global_alias = action == "--global"
+        if global_alias:
+            name, target = self._split_first(arg)
+        else:
+            name, target = action, arg
+        if not name or not target:
+            return CommandOutcome("用法：.alias 名称 .指令 或 .alias --global 名称 .指令")
+        if not target.startswith((".", "。")):
+            target = "." + target
+        if global_alias:
+            group.aliases[name] = target
+        else:
+            player.aliases[name] = target
+        return CommandOutcome(f"快捷指令已保存：{name} -> {target}")
+
+    def _cmd_alias_exec(self, cmd: str, rest: str, group: GroupState, player: PlayerState, user_id: str) -> CommandOutcome:
+        name, extra = self._split_first(rest.strip())
+        if not name:
+            return CommandOutcome("用法：.&名称 或 .a 名称")
+        target = player.aliases.get(name) or group.aliases.get(name)
+        if not target:
+            return CommandOutcome(f"未设置快捷指令：{name}")
+        if extra:
+            target = target + " " + extra
+        if target.strip() == self._current_context.get("raw", "").strip():
+            return CommandOutcome("快捷指令循环调用已停止。")
+        outcome = self.handle(
+            target,
+            group_id=self._current_context.get("group_id", "private"),
+            user_id=user_id,
+            sender_name=self._current_context.get("sender_name", ""),
+        )
+        if outcome is None:
+            return CommandOutcome(f"快捷指令没有产生回复：{name}")
+        return CommandOutcome(f"快捷指令 {name}：\n{outcome.text}", group_card=outcome.group_card, report_card_status=outcome.report_card_status)
+
+    def _cmd_reply(self, cmd: str, rest: str, group: GroupState, player: PlayerState, user_id: str) -> CommandOutcome:
+        action = rest.strip().lower() or "status"
+        if action in {"on", "enable"}:
+            group.custom_replies_enabled = True
+            return CommandOutcome("自定义回复兼容层已开启。")
+        if action in {"off", "disable"}:
+            group.custom_replies_enabled = False
+            return CommandOutcome("自定义回复兼容层已关闭。")
+        state = "开启" if group.custom_replies_enabled else "关闭"
+        return CommandOutcome(f"自定义回复兼容层：{state}。复杂回复规则将进入兼容层。")
+
+    def _cmd_jrrp(self, cmd: str, rest: str, group: GroupState, player: PlayerState, user_id: str) -> CommandOutcome:
+        today = time.strftime("%Y-%m-%d")
+        digest = hashlib.sha256(f"{today}:{user_id}".encode()).hexdigest()
+        value = int(digest[:8], 16) % 100 + 1
+        name = player.nickname or user_id
+        return CommandOutcome(f"{name} 今日人品：{value}")
+
+    def _cmd_gugu(self, cmd: str, rest: str, group: GroupState, player: PlayerState, user_id: str) -> CommandOutcome:
+        target = rest.strip() or player.nickname or user_id
+        return CommandOutcome(f"{target} 咕咕了一下。")
+
+    def _cmd_ping(self, cmd: str, rest: str, group: GroupState, player: PlayerState, user_id: str) -> CommandOutcome:
+        return CommandOutcome("pong")
+
+    def _cmd_who(self, cmd: str, rest: str, group: GroupState, player: PlayerState, user_id: str) -> CommandOutcome:
+        names = [part.strip() for part in re.split(r"[\s,，]+", rest.strip()) if part.strip()]
+        if not names:
+            names = [p.nickname or uid for uid, p in group.players.items()]
+        if not names:
+            return CommandOutcome("当前没有可随机的对象。")
+        self.roller.rng.shuffle(names)
+        return CommandOutcome("随机顺序：\n" + "\n".join(f"{i + 1}. {name}" for i, name in enumerate(names)))
+
+    def _cmd_name(self, cmd: str, rest: str, group: GroupState, player: PlayerState, user_id: str) -> CommandOutcome:
+        parts = rest.split()
+        count = 1
+        style = "dnd" if cmd == "namednd" else "cn"
+        for part in parts:
+            if part.isdigit():
+                count = max(1, min(10, int(part)))
+            else:
+                style = part.lower()
+        names = []
+        for _ in range(count):
+            if style in {"dnd", "fantasy"}:
+                names.append(self.roller.rng.choice(DND_NAMES))
+            else:
+                names.append(self.roller.rng.choice(CN_SURNAMES) + self.roller.rng.choice(CN_GIVEN))
+        return CommandOutcome("随机姓名：\n" + "\n".join(names))
+
+    def _cmd_modu(self, cmd: str, rest: str, group: GroupState, player: PlayerState, user_id: str) -> CommandOutcome:
+        keyword = rest.strip() or "随机"
+        return CommandOutcome(f"模组工具已接入兼容层。当前查询关键词：{keyword}")
+
+    def _cmd_userid(self, cmd: str, rest: str, group: GroupState, player: PlayerState, user_id: str) -> CommandOutcome:
+        group_id = self._current_context.get("group_id", "private")
+        return CommandOutcome(f"用户 ID：{user_id}\n群 ID：{group_id}")
+
+    def _cmd_botlist(self, cmd: str, rest: str, group: GroupState, player: PlayerState, user_id: str) -> CommandOutcome:
+        state = "开启" if group.active else "关闭"
+        route = self.config.get("route", "python")
+        return CommandOutcome(f"当前群骰子：{state}\n运行路线：{route}")
+
+    def _cmd_dismiss(self, cmd: str, rest: str, group: GroupState, player: PlayerState, user_id: str) -> CommandOutcome:
+        group.active = False
+        return CommandOutcome("骰子已在当前会话关闭。")
+
+    def _cmd_master(self, cmd: str, rest: str, group: GroupState, player: PlayerState, user_id: str) -> CommandOutcome:
+        return CommandOutcome("骰主权限由 AstrBot 管理员体系承接。插件内保留 SeaDice master 指令入口。")
+
+    def _cmd_ban(self, cmd: str, rest: str, group: GroupState, player: PlayerState, user_id: str) -> CommandOutcome:
+        action, arg = self._split_first(rest.strip())
+        action = action.lower() or "list"
+        if action in {"list", "ls"}:
+            if not group.bans:
+                return CommandOutcome("当前群黑名单为空。")
+            lines = [f"{uid}: {reason}" for uid, reason in sorted(group.bans.items())]
+            return CommandOutcome("当前群黑名单：\n" + "\n".join(lines))
+        if action in {"add", "on"}:
+            target, reason = self._split_first(arg)
+            if not target:
+                return CommandOutcome("用法：.ban add 用户ID 原因")
+            group.bans[target] = reason.strip() or "未填写原因"
+            return CommandOutcome(f"已加入黑名单：{target}")
+        if action in {"del", "rm", "off"}:
+            target = arg.strip()
+            if group.bans.pop(target, None) is None:
+                return CommandOutcome("没有找到黑名单记录。")
+            return CommandOutcome(f"已移出黑名单：{target}")
+        return CommandOutcome("用法：.ban list/add/del")
+
+    def _cmd_team(self, cmd: str, rest: str, group: GroupState, player: PlayerState, user_id: str) -> CommandOutcome:
+        action, arg = self._split_first(rest.strip())
+        action = action.lower() or "list"
+        if action in {"list", "ls"}:
+            if not group.teams:
+                return CommandOutcome("当前没有队伍。")
+            lines = [f"{name}: {' '.join(members)}" for name, members in group.teams.items()]
+            return CommandOutcome("队伍列表：\n" + "\n".join(lines))
+        if action == "add":
+            name, members_text = self._split_first(arg)
+            members = [item for item in re.split(r"[\s,，]+", members_text) if item]
+            if not name:
+                return CommandOutcome("用法：.team add 队伍名 成员1 成员2")
+            if not members:
+                members = [player.nickname or user_id]
+            group.teams.setdefault(name, [])
+            for member in members:
+                if member not in group.teams[name]:
+                    group.teams[name].append(member)
+            return CommandOutcome(f"队伍已更新：{name}")
+        if action in {"del", "rm"}:
+            name = arg.strip()
+            if group.teams.pop(name, None) is None:
+                return CommandOutcome("没有找到队伍。")
+            return CommandOutcome(f"队伍已删除：{name}")
+        if action in {"clear", "clr"}:
+            group.teams.clear()
+            return CommandOutcome("队伍已清空。")
+        return CommandOutcome("用法：.team list/add/del/clear")
+
+    def _cmd_compat_placeholder(self, cmd: str, rest: str, group: GroupState, player: PlayerState, user_id: str) -> CommandOutcome:
+        if not self._config_bool("reply_to_unknown_compat_command", True):
+            return CommandOutcome("")
+        return CommandOutcome(f".{cmd} 已登记为 SeaDice 兼容项，完整行为将在后续模块补齐。")
+
+    def _draw_from_deck(self, deck_name: str, group: GroupState) -> CommandOutcome:
+        cards = self._deck_cards(deck_name, group)
+        if not cards:
+            return CommandOutcome(f"没有找到牌堆：{deck_name}")
+        card = self.roller.rng.choice(cards)
+        return CommandOutcome(f"{deck_name} 抽牌：{card}")
+
+    def _deck_cards(self, deck_name: str, group: GroupState) -> list[str]:
+        name = deck_name.strip() or "coc"
+        if name in group.decks:
+            return group.decks[name]
+        return DEFAULT_DECKS.get(name, [])
+
+    def _config_bool(self, key: str, default: bool) -> bool:
+        value = self.config.get(key, default)
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "on", "开启"}
+        return bool(value)
 
     def _group(self, group_id: str) -> GroupState:
         gid = group_id or "private"
@@ -843,11 +1259,70 @@ class SeaDiceService:
     def _parse_check_target(self, rest: str, sheet: CharacterSheet) -> tuple[str, int]:
         if not rest:
             return "检定", 50
+        if rest.lstrip("-").isdigit():
+            return "检定", int(rest)
         parts = rest.split()
         if len(parts) >= 2 and parts[-1].lstrip("-").isdigit():
             return " ".join(parts[:-1]), int(parts[-1])
-        key = self._attr_key(rest, sheet)
-        return rest, int(sheet.attrs.get(key, 50 if sheet.rule == "coc" else 10))
+        name, explicit_value = self._split_name_value(rest)
+        key = self._attr_key(name, sheet)
+        value = explicit_value
+        if value is None:
+            value = int(sheet.attrs.get(key, 50 if sheet.rule == "coc" else 10))
+        return name, value
+
+    def _parse_attr_change(self, item: str) -> tuple[str, str, str] | None:
+        with_op = re.fullmatch(r"([^=+\-:：]+)([=+\-:：])(.+)", item)
+        if with_op:
+            key, op, value_text = with_op.groups()
+            return key, op, value_text
+        compact = re.fullmatch(r"(.+?)(-?\d.*|[dD]\d.*)", item)
+        if compact:
+            key, value_text = compact.groups()
+            return key, "=", value_text
+        return None
+
+    def _split_name_value(self, text: str) -> tuple[str, int | None]:
+        stripped = text.strip()
+        if re.fullmatch(r"\d*[dD]\d+.*", stripped):
+            return text, None
+        compact = re.fullmatch(r"(.+?)(-?\d+)", stripped)
+        if not compact:
+            return text, None
+        name, value = compact.groups()
+        if not name:
+            return text, None
+        return name, int(value)
+
+    def _parse_san_args(self, text: str, sheet: CharacterSheet) -> tuple[str, str, str, int]:
+        target = int(sheet.attrs.get("san", sheet.attrs.get("理智", 0)))
+        parts = text.split()
+        if not parts:
+            return "d100", "0", "1d6", target
+
+        first = parts[0].strip(",，")
+        if "/" in first:
+            success_expr, fail_expr = self._split_san_loss(first)
+            if len(parts) > 1 and parts[1].lstrip("-").isdigit():
+                target = int(parts[1])
+            return "d100", success_expr, fail_expr, target
+
+        if len(parts) == 1:
+            return "d100", "0", first, target
+
+        dice_expr = first
+        loss_token = parts[1].strip(",，")
+        if "/" in loss_token:
+            success_expr, fail_expr = self._split_san_loss(loss_token)
+        else:
+            success_expr, fail_expr = "0", loss_token
+        if len(parts) > 2 and parts[2].lstrip("-").isdigit():
+            target = int(parts[2])
+        return dice_expr, success_expr, fail_expr, target
+
+    def _split_san_loss(self, text: str) -> tuple[str, str]:
+        success_expr, fail_expr = text.split("/", 1)
+        return success_expr.strip() or "0", fail_expr.strip() or "0"
 
     def _coc_level(self, roll: int, target: int) -> str:
         if roll == 1:
@@ -944,14 +1419,23 @@ class SeaDiceService:
             group = GroupState(
                 active=group_data.get("active", True),
                 rule=group_data.get("rule", "coc"),
+                coc_rule=group_data.get("coc_rule", "0"),
                 active_log=group_data.get("active_log", ""),
                 initiative=group_data.get("initiative", []),
+                aliases=group_data.get("aliases", {}),
+                decks=group_data.get("decks", {}),
+                custom_replies_enabled=group_data.get("custom_replies_enabled", True),
+                helpdocs=group_data.get("helpdocs", {}),
+                sealpacks=group_data.get("sealpacks", {}),
+                teams=group_data.get("teams", {}),
+                bans=group_data.get("bans", {}),
             )
             for uid, player_data in group_data.get("players", {}).items():
                 player = PlayerState(
                     nickname=player_data.get("nickname", ""),
                     active=player_data.get("active", "default"),
                     sn_template=player_data.get("sn_template", ""),
+                    aliases=player_data.get("aliases", {}),
                 )
                 for name, sheet_data in player_data.get("sheets", {}).items():
                     player.sheets[name] = CharacterSheet(**sheet_data)
